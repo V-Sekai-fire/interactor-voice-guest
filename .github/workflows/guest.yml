@@ -1,8 +1,10 @@
-# voice.elf from source with the shared guest recipe, then the harness and the loopback gate, each with
-# its control, against the pinned double-precision editor and godot_sandbox addon. The gates run on the
-# ELF this workflow built, which replaces the tracked project/voice.elf in the gate job; the tracked
-# one is compared against it and a difference is reported, not failed, as the two may come from
-# different clang builds.
+# voice.elf from source with the shared guest recipe at both precisions (single and double), then the
+# harness and the loopback gate, each with its control, against the pinned double-precision editor and
+# godot_sandbox addon. The gates run on the double ELF this workflow built, which replaces the tracked
+# project/voice.elf in the gate job; the tracked one is compared against it and a difference is
+# reported, not failed, as the two may come from different clang builds. A push to main releases both
+# ELFs under the commit's Go pseudo-version tag (RFD66606-2312). The single gate waits for a pinned
+# single-precision engine.
 name: guest
 
 on:
@@ -28,6 +30,10 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        precision: [single, double]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,13 +69,17 @@ jobs:
         env:
           RISCV64_SYSROOT: ${{ github.workspace }}/weft/5-repository/riscv64-sysroot
           BUILD_DIR: ${{ runner.temp }}/build
+          PRECISION: ${{ matrix.precision }}
         run: ./build.sh
-      - name: The ELF is an rv64gc double-precision guest, symbols kept, no build paths
+      - name: The ELF is an rv64gc guest of the matrix precision, symbols kept, no build paths
         working-directory: weft/3-interactor/voice
+        env:
+          PRECISION: ${{ matrix.precision }}
         run: |
           E=project/voice.elf
+          case "$PRECISION" in single) variant="18000000" ;; double) variant="28000000" ;; esac
           file "$E" | grep -q "UCB RISC-V"
-          llvm-objdump -s -j .sandbox_variant "$E" | grep -q "53425856 28000000"
+          llvm-objdump -s -j .sandbox_variant "$E" | grep -q "53425856 $variant"
           if llvm-readelf -A "$E" | grep -q "_v1p0"; then echo "voice.elf uses the V extension"; exit 1; fi
           # --strip-debug only: the Sandbox finds the API through .symtab, which -s would remove.
           llvm-nm "$E" | grep -q " T main\$" || { echo "no .symtab: was voice.elf stripped with -s?"; exit 1; }
@@ -79,7 +89,10 @@ jobs:
           done
           test "$(strings "$E" | grep -c "$GITHUB_WORKSPACE")" = 0
           sha256sum "$E"
+      - name: Name the ELF by its precision
+        run: cp weft/3-interactor/voice/project/voice.elf "weft/3-interactor/voice/project/voice.${{ matrix.precision }}.elf"
       - name: Compare with the tracked voice.elf
+        if: matrix.precision == 'double'
         run: |
           built=$(sha256sum weft/3-interactor/voice/project/voice.elf | cut -d' ' -f1)
           tracked=$(sha256sum "$RUNNER_TEMP/tracked.elf" | cut -d' ' -f1)
@@ -90,8 +103,8 @@ jobs:
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: voice-elf-${{ github.sha }}
-          path: weft/3-interactor/voice/project/voice.elf
+          name: voice-elf-${{ matrix.precision }}-${{ github.sha }}
+          path: weft/3-interactor/voice/project/voice.${{ matrix.precision }}.elf
           if-no-files-found: error
 
   gate:
@@ -100,11 +113,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: The built voice.elf in place of the tracked one
+      - name: The built double voice.elf in place of the tracked one
         uses: actions/download-artifact@v4
         with:
-          name: voice-elf-${{ github.sha }}
+          name: voice-elf-double-${{ github.sha }}
           path: project
+      - run: mv project/voice.double.elf project/voice.elf
       - name: The pinned engine and addon, checked against their release's SHA256SUMS
         run: |
           base=https://github.com/V-Sekai-fire/service-godot-build/releases/download
@@ -162,3 +176,29 @@ jobs:
         run: |
           timeout 300 "$GODOT" --headless --path project --script harness.gd ++ --control | tee harness-control.txt
           grep -q "^RESULT: control fails, as it must" harness-control.txt
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: voice-elf-*-${{ github.sha }}
+          path: elfs
+          merge-multiple: true
+      - name: The release, tagged with the commit's Go pseudo-version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          when=$(date -u -d "@$(git show -s --format=%ct "$GITHUB_SHA")" +%Y%m%d%H%M%S)
+          tag="v0.0.0-$when-${GITHUB_SHA:0:12}"
+          (cd elfs && sha256sum voice.single.elf voice.double.elf > SHA256SUMS && cat SHA256SUMS)
+          if gh release view "$tag" >/dev/null 2>&1; then echo "$tag exists"; exit 0; fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "voice guest $tag, single and double precision" \
+            --notes "voice.single.elf and voice.double.elf built from $GITHUB_SHA; sha256 in SHA256SUMS." \
+            elfs/voice.single.elf elfs/voice.double.elf elfs/SHA256SUMS
